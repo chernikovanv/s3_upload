@@ -31,6 +31,7 @@ restartable, shardable across machines, and must leave evidence of what happened
   - [Unreadable source objects](#unreadable-source-objects)
   - [A failing source](#a-failing-source)
 - [Security notes](#security-notes)
+- [Taking a request from Support Hub](#taking-a-request-from-support-hub)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -575,6 +576,41 @@ directory, and a fresh run picks up from whatever is already at the destination.
   `<destination>/<cid>/__migration__/` as secret material and restrict access to it.
 - Endpoints, prefixes and credentials are rejected if they contain newlines or
   structural surprises, so a crafted config cannot inject extra rclone config directives.
+
+---
+
+## Taking a request from Support Hub
+
+`tools/supporthub_get_ticket.py` reads a backup-export request (`mdb-backup-export`)
+from Yandex Cloud Support Hub, writes its fields to a JSON file, takes the ticket into
+work and leaves an internal comment:
+
+```bash
+python3 tools/supporthub_get_ticket.py --key sa-key.pem --sa-id <SA_ID> \
+    --ticket <TICKET_ID> --out <TICKET_ID>.json --dry-run   # look first, change nothing
+python3 tools/supporthub_get_ticket.py --key sa-key.pem --sa-id <SA_ID> \
+    --ticket <TICKET_ID> --out <TICKET_ID>.json
+```
+
+The JSON holds `id`, `publicStatus`, `supportLevel`, `cluster_type` (from the ticket's
+services), and `cluster_id`, `s3_endpoint`, `s3_bucket`, `s3_access_key_id`,
+`s3_secret_key` parsed from the request form; `parse_status` is `check` if anything
+could not be parsed. It contains the customer's live S3 credentials and is written at
+mode `0600`.
+
+| Option | Effect |
+| --- | --- |
+| `--dry-run` | Only write the JSON; the ticket is not changed. |
+| `--skip-status` | Do not take the ticket on, only add the comment. |
+| `--force` | Proceed even if the ticket is already in work (status `in_progress` or an assignee is set). Without it the tool changes nothing and exits with code `3`. |
+| `--comment TEXT` | Comment text, default `MDB: взяли в работу`. Always an internal message, never visible to the customer. |
+| `--key-id ID` | Key id, if the PEM file lacks the `Key ID` header line. |
+
+Taking on assigns the ticket to the service account and shows "In progress" to the
+customer. Unlike `s3_upload.py`, this tool needs `requests` and `cryptography`
+(`pip install requests cryptography`) and an authorized key of a service account with
+access to Support Hub. Run `--help` or read the module docstring for the full
+description and exit codes.
 
 ---
 
