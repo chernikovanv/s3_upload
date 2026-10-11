@@ -29,6 +29,7 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Verify-only mode](#verify-only-mode)
 - [Error handling](#error-handling)
   - [Unreadable source objects](#unreadable-source-objects)
+  - [A failing source](#a-failing-source)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 
@@ -137,6 +138,8 @@ python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclon
 | `B` | `1` | Total number of shards. Must be `> 0`. |
 | `-p`, `--parallel` | `10` | rclone `--transfers`. Checkers are set to `max(4, N)`. |
 | `--verify` | off | Compare only; copy nothing. See [Verify-only mode](#verify-only-mode). |
+| `--max-errors` | `100` | Abort a copy pass once the source is clearly broken, instead of grinding through every remaining object. `0` disables. See [A failing source](#a-failing-source). |
+| `--stall-timeout` | `300` | Kill rclone if it prints nothing for this many seconds. `--stats 10s` should print continuously, so silence means it is wedged. |
 | `--fast-list` | off | Pass rclone `--fast-list` to every recursive listing. Far fewer S3 requests on a large bucket; holds the listing in rclone's memory too. |
 | `--no-traverse` | off | Pass rclone `--no-traverse` to the copy. Only pays off when little is left to copy — see [Resuming](#resuming-an-interrupted-migration). |
 | `--state-dir` | `copy_s3_state_<cid>` | Where run directories are created. |
@@ -508,6 +511,39 @@ are counted in `verification.json`, the run exits `1`, and the local credential 
 an unreadable `*_backup_stop_sentinel.json` may mean that backup cannot be restored, so
 that has to stay visible.
 
+### A failing source
+
+rclone is given `--retries 1`, so a pass walks the file list exactly once. When the
+source is returning `500 InternalError` broadly, every object fails — and fails *slowly*,
+because the AWS SDK's rate limiter throttles retries (`failed to get rate limit token,
+retry quota exceeded`). With 100k objects left that is days of work at zero throughput,
+while `--stats 10s` keeps printing. It looks like a hang.
+
+Two guards bound it:
+
+**`--max-errors` (default 100)** aborts the pass when the source is clearly broken,
+which is either of:
+
+- `max_errors` errors that **cannot be skipped** — a real failure such as `403`, even if
+  other objects are transferring fine; or
+- `max_errors` errors of **any kind with nothing transferred at all**, after a 120-second
+  grace period so a slow first object cannot trip it.
+
+The second condition is the one that catches a `500` storm, because a `500` on
+`GetObject` is individually skippable — without it, a source failing every object would
+never trip the cap.
+
+**`--stall-timeout` (default 300s)** kills rclone if it prints nothing at all for that
+long. Since `--stats 10s` prints continuously while rclone lives, silence means wedged
+rather than slow.
+
+Either way rclone and anything it spawned are killed as a process group, the pass is
+recorded as failed, and the run continues to the next pass and then to the final report —
+so you get `failed.jsonl` and an exit code instead of a process to `kill -9`. A source
+that is broadly 500-ing will fail all three passes quickly and report, which is the
+intended outcome: that is a source-side incident to escalate, not something to retry for
+a week.
+
 **Objects that vanish.** An object listed early and gone by the final listing is
 reported as `no longer in source`, not as a failure of the copy.
 
@@ -544,6 +580,8 @@ directory, and a fresh run picks up from whatever is already at the destination.
 | `FATAL: source prefix ... contains no files; check the prefix` | The unfiltered source listing is empty — wrong bucket, wrong prefix, or no `ListBucket` permission. |
 | `destination LS did not show ...` | Destination is eventually consistent, or the credentials can `PUT` but not `LIST`. |
 | `probe deletion failed` | Destination credentials lack `DeleteObject`. A stray probe object is left under `__migration__/`. |
+| Run appears to hang at `Speed: 0.00 MiB/s` with errors climbing | A source-side `500` storm. Since the guards landed this aborts the pass in ~2 minutes; on an older copy of the script it would grind for days. See [A failing source](#a-failing-source). |
+| `rclone copy aborted: ... no output for 300s` | rclone wedged and was killed. Check `pass-N-rclone.jsonl` for the last thing it did. |
 | `rclone was not found and apt-get is unavailable` | Install rclone manually, or pass `--rclone /path/to/rclone`. |
 | `installing rclone requires root or passwordless sudo` | Install rclone yourself; the script will not prompt for a password. |
 | Exit `1` with ranges clustered in one window | A source-side incident during that window. Re-run the shard; objects that are still absent will show up again. |

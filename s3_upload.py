@@ -7,12 +7,15 @@ S3 provides LastModified, not the original creation time of an object.
 import argparse
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta, timezone
@@ -445,8 +448,38 @@ def skip_source_object(run_dir, skipped, record, error, stage, reason):
           file=sys.stderr, flush=True)
 
 
+# How long a copy pass may transfer nothing before a flood of errors is taken
+# as a broken source rather than one slow object.
+ZERO_PROGRESS_GRACE = 120
+
+
+def pump(stream, lines):
+    """Feed a subprocess stream into a queue so the reader can time out."""
+    try:
+        for line in stream:
+            lines.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        lines.put(None)
+
+
+def kill_group(process):
+    """Kill rclone and anything it spawned.
+
+    Killing only rclone would leave a child holding the write end of the pipe,
+    so the reader thread would never see EOF and closing the stream would then
+    deadlock against the read it is blocked in.
+    """
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        process.kill()
+
+
 def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, attempt,
-               completed=0, total=None, skipped=None, no_traverse=False):
+               completed=0, total=None, skipped=None, no_traverse=False,
+               stall_timeout=300, max_errors=100):
     # files-from0 overrides hash-filter. Its input comes only from a shard-filtered
     # listing, so rclone's native hash function defines the shard for every pass.
     file_list = run_dir / f"pass-{attempt}-files.bin"
@@ -470,11 +503,33 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
     records_by_key = {record["key"]: record for record in records}
     total = len(records) + completed if total is None else total
     last_transferred = 0
+    aborted = None
+    started = time.monotonic()
     with log.open("w", encoding="utf-8") as saved:
         os.chmod(log, 0o600)
         with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                              text=True, encoding="utf-8", errors="replace") as process:
-            for line in process.stderr:
+                              text=True, encoding="utf-8", errors="replace",
+                              start_new_session=True) as process:
+            lines = queue.Queue()
+            reader = threading.Thread(target=pump, args=(process.stderr, lines),
+                                      daemon=True)
+            reader.start()
+            while True:
+                try:
+                    # --stats 10s makes rclone print continuously while it lives,
+                    # so a long silence means it is wedged rather than slow.
+                    line = lines.get(timeout=stall_timeout)
+                except queue.Empty:
+                    aborted = (f"no output for {stall_timeout}s while --stats 10s "
+                               f"should be printing; rclone was killed")
+                    break
+                except KeyboardInterrupt:
+                    # rclone runs in its own session, so Ctrl-C does not reach it.
+                    kill_group(process)
+                    process.wait()
+                    raise
+                if line is None:
+                    break
                 saved.write(line)
                 saved.flush()
                 try:
@@ -504,7 +559,28 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
                     else:
                         unskipped.append(str(message))
                     print(f"ERROR [{attempt}/3] {message}", file=sys.stderr, flush=True)
+                    # A failing source errors on every object slowly, so letting the
+                    # pass run to completion takes days. Stop once it is clear the
+                    # source is broken: either many errors nothing can skip past, or
+                    # many errors of any kind with nothing transferring at all. The
+                    # grace period keeps a slow first large file from tripping it.
+                    stuck = (len(errors) >= max_errors and not last_transferred
+                             and time.monotonic() - started > ZERO_PROGRESS_GRACE)
+                    if max_errors and (len(unskipped) >= max_errors or stuck):
+                        aborted = (f"{len(errors)} errors ({len(unskipped)} not "
+                                   f"skippable) after {last_transferred} objects "
+                                   f"transferred; rclone was killed rather than "
+                                   f"working through the remaining "
+                                   f"{len(records) - last_transferred} objects")
+                        break
+            if aborted:
+                kill_group(process)
             returncode = process.wait()
+            # Let the reader drain before the stream is closed underneath it.
+            reader.join(timeout=30)
+    if aborted:
+        raise RuntimeError(f"rclone copy aborted: {aborted}; details: {log}; "
+                           f"last error: {(errors[-1] if errors else 'none')[-1000:]}")
     if returncode:
         # A non-zero exit caused only by skippable source reads is not a pass failure:
         # those objects are already recorded and excluded from the remaining passes.
@@ -805,7 +881,7 @@ def run_impl(args, started, stack):
         try:
             copy_batch(args.rclone, cfg, src_prefix, dst_prefix, candidates,
                        args.parallel, run_dir, attempt, completed, len(discovered),
-                       skipped, args.no_traverse)
+                       skipped, args.no_traverse, args.stall_timeout, args.max_errors)
         except (OSError, RuntimeError, ValueError) as exc:
             copy_errors[attempt] = str(exc)
             print(f"ERROR [{attempt}/3] {exc}", file=sys.stderr, flush=True)
@@ -1789,6 +1865,13 @@ def main():
     parser.add_argument("-p", "--parallel", type=int, default=10)
     parser.add_argument("--verify", action="store_true",
                         help="only compare this shard and report time ranges of missing files")
+    parser.add_argument("--max-errors", type=int, default=100,
+                        help="abort a copy pass after this many errors that cannot be "
+                             "skipped, instead of grinding through every remaining "
+                             "object on a failing source (0 disables; default: 100)")
+    parser.add_argument("--stall-timeout", type=int, default=300,
+                        help="kill rclone if it prints nothing for this many seconds; "
+                             "--stats 10s should print continuously (default: 300)")
     parser.add_argument("--fast-list", action="store_true",
                         help="list with rclone --fast-list: far fewer S3 requests on a "
                              "large bucket, at the cost of holding the listing in "
@@ -1805,6 +1888,10 @@ def main():
         parser.error("require b > 0 and 0 <= a < b")
     if args.parallel <= 0:
         parser.error("require -p > 0")
+    if args.max_errors < 0:
+        parser.error("require --max-errors >= 0")
+    if args.stall_timeout <= 0:
+        parser.error("require --stall-timeout > 0")
     try:
         ensure_rclone(args.rclone)
         return run(args, started)
