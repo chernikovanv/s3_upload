@@ -2,6 +2,7 @@ import argparse
 import json
 import pprint
 import os
+import sys
 import os.path
 import subprocess
 from pathlib import Path
@@ -32,6 +33,19 @@ def prepare_export_dir(ticket):
     p = Path(os.path.join(EXPORTS, str(ticket)))
     p.mkdir(parents=True, exist_ok=True)
 
+def manual_ticket_info(ticket):
+    data = {
+        'id': ticket,
+    }
+    data['cluster_type'] = resolve_ctype(input("Тип кластера:"))
+    data['s3_endpoint'] = input("S3 endpoint:").strip()
+    data['s3_bucket'] = input("S3 bucket:").strip()
+    data['s3_access_key_id'] = input("S3 access key (короткий):").strip()
+    data['s3_secret_key'] = input("S3 secret key (длинный):").strip()
+    data['cluster_id'] = input("Идентификатор кластера:").strip()
+    with open(os.path.join(EXPORTS, ticket, 'ticket.json'), "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=4)
+
 def get_ticket_info(ticket):
     subprocess.check_call([
         'python3', os.path.join(REPO, 'tools/supporthub_get_ticket.py'),
@@ -51,6 +65,29 @@ def get_gpg_key(cid):
         sys.exit(1)
     return key
 
+CTYPES = [
+    'postgresql',
+    'mysql',
+    'redis',
+    'clickhouse',
+    'mongodb',
+    ]
+
+def resolve_ctype(ctype):
+    ctype = ctype.lower().strip()
+    ctype = ctype.split('-')[-1]
+    if ctype not in CTYPES:
+        print(f"Invalid cluster type: {ctype}.  Should be one of {CTYPES}")
+        sys.exit(1)
+    return ctype
+
+
+def resolve_region(endpoint):
+    if "vkcloud-storage" in endpoint:
+        return "ru-msk"
+    return "US"
+
+
 def prepare_upload_config(ticket):
     ticket_info = _read_json(os.path.join(EXPORTS, ticket, 'ticket.json'))
     print('Ticket info:')
@@ -67,7 +104,7 @@ def prepare_upload_config(ticket):
     if bucket[:5] != 's3://':
         bucket = 's3://' + bucket
     ctype = ticket_info['cluster_type']
-    # TODO: clean ?
+    ctype = resolve_ctype(ctype)
 
     gpg_key = get_gpg_key(cid)
 
@@ -85,7 +122,7 @@ def prepare_upload_config(ticket):
         "prefix": bucket,
         "access_key": ticket_info['s3_access_key_id'],
         "secret_key": ticket_info['s3_secret_key'],
-        "region": "US"
+        "region": resolve_region(endpoint),
       },
       "cluster_type": ctype,
       "gpg": {
@@ -103,14 +140,19 @@ def run_upload(ticket):
 
 # Создаём парсер с описанием программы
 parser = argparse.ArgumentParser(description="export backups all in one")
+parser.add_argument("--manual",  action=argparse.BooleanOptionalAction)
 parser.add_argument("ticket", help="ID тикета из backoffice")
 args = parser.parse_args()
 
 print("PREPARING EXPORT DIR")
 prepare_export_dir(args.ticket)
 
-print("GETTING TICKET INFO")
-get_ticket_info(args.ticket)
+if args.manual:
+    print("ENTER TICKET INFO")
+    manual_ticket_info(args.ticket)
+else:
+    print("GETTING TICKET INFO")
+    get_ticket_info(args.ticket)
 
 print("PREPARING UPLOAD CONFIG")
 prepare_upload_config(args.ticket)
