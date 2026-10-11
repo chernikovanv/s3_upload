@@ -40,6 +40,7 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Security notes](#security-notes)
 - [Taking a request from Support Hub](#taking-a-request-from-support-hub)
   - [Checking the request against a clusters reference](#checking-the-request-against-a-clusters-reference)
+  - [Marking the request as solved](#marking-the-request-as-solved)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -783,6 +784,36 @@ If the check fails, the ticket is not changed and the exit code is `4`. The JSON
 `organization_id`, `cloud_id` and a `check` block (`status`, `message`, and the values
 from the ticket and the reference). A cluster created after the reference was built
 fails as "not in the reference", so rebuild the reference before processing new tickets.
+
+### Marking the request as solved
+
+`tools/supporthub_solve_ticket.py` closes the loop after the export: it adds an internal
+comment and applies the `solve` action with a resolution taxonomy. It works on a ticket
+that `supporthub_get_ticket_v2.py` (or `supporthub_get_ticket.py`) has taken into work, so
+the ticket is `in_progress` and the service account is its assignee; Support Hub allows
+`solve` only to the assignee.
+
+```bash
+python3 tools/supporthub_solve_ticket.py --key sa-key.pem --sa-id <SA_ID> \
+    --ticket <TICKET_ID> --dry-run   # checks only, change nothing
+python3 tools/supporthub_solve_ticket.py --key sa-key.pem --sa-id <SA_ID> --ticket <TICKET_ID>
+```
+
+| Option | Effect |
+| --- | --- |
+| `--taxonomy NAME` | Resolution taxonomy, default `Проблема в Облаке: compute: инцидент`. Checked against `GET /private/v2/taxonomies`: the server would silently create a new taxonomy from a misspelt name. |
+| `--comment TEXT` | Internal comment, default `MDB: выгрузка выполнена`. Always type `inner`, never visible to the customer. |
+| `--dry-run` | Only run the checks; the ticket is not changed. |
+| `--force` | Solve even if the ticket is not in work by this service account (only if `solve` is available to it). |
+| `--key-id ID` | Key id, if the PEM file lacks the `Key ID` header line. |
+
+Exit codes: `0` solved (or `--dry-run`), `3` already solved or closed, `5` not in work by
+this service account, `1` any error. If the comment was added but `solve` failed, the
+exit code is `1` and the comment stays in the ticket.
+
+Taking on, the internal comment and `solve` send the customer no notification; the
+console shows the public status "Solved". Support Hub closes a solved ticket by its
+closing timer and notifies the customer then. A customer reply reopens the ticket.
 
 ---
 
