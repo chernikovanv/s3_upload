@@ -20,6 +20,7 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Quick start](#quick-start)
 - [Command line](#command-line)
 - [Configuration file](#configuration-file)
+- [Do-not-copy list](#do-not-copy-list)
 - [Sharding](#sharding)
 - [How a run works](#how-a-run-works)
 - [Output files](#output-files)
@@ -37,6 +38,8 @@ restartable, shardable across machines, and must leave evidence of what happened
 - Copies `source.prefix` → `destination.prefix/<cid>/`, preserving the key layout.
 - Splits the work into shards (`A` of `B`) so several processes or hosts can run in
   parallel over disjoint parts of the keyspace.
+- Refuses outright if either bucket belongs to a cluster on the embedded
+  [do-not-copy list](#do-not-copy-list).
 - Runs preflight checks before touching data: source `LS`, source `GET`, and a full
   destination `PUT` → `GET` → `LS` → `DELETE` probe cycle.
 - Uploads a sanitised copy of the config (everything except S3 credentials) next to the
@@ -198,6 +201,52 @@ destination bucket will contain your GPG key and any passphrase or admin passwor
 see [Security notes](#security-notes).
 
 S3 credentials are **never** uploaded.
+
+---
+
+## Do-not-copy list
+
+Some clusters must never be migrated. Their cluster ids are **embedded in
+`s3_upload.py`** as `BLOCKED_CIDS` (currently 2673 ids, near the bottom of the file).
+Embedding rather than shipping a sidecar file is deliberate: this is a single-file tool
+that gets copied to migration hosts on its own, and the protection has to travel with it.
+
+Before anything else — before any network call, before the state directory is created —
+`read_config` checks the **bucket name** of `source.prefix` and `destination.prefix`. If
+a blocked cluster id appears anywhere in either bucket name, the run is refused:
+
+```
+$ python3 s3_upload.py config.json
+FATAL: refusing to run: source bucket 'dbaas-c9q00git8mmr2mt99uk4' belongs to a
+cluster on the do-not-copy list (c9q00git8mmr2mt99uk4)
+```
+
+Exit code is `2`. Nothing is created and your config file is left untouched.
+
+Matching details:
+
+- **Bucket name only** — the part between `s3://` and the first `/`. A blocked id that
+  appears only in the *path* (`s3://backup-src/wal-g/<cid>/`) does **not** refuse the
+  run, and neither does `config.cid`.
+- **Substring, case-insensitive** — `s3://yandexcloud-dbaas-<cid>` matches, as does an
+  uppercased bucket name. Cluster ids are 20-character random strings, so an accidental
+  match is not a practical concern.
+- Every blocked id found is named in the error, so a bucket covering several clusters
+  reports all of them.
+
+### Refreshing the list
+
+Re-export the clusters CSV, then regenerate the embedded block in place:
+
+```bash
+python3 tools/update_blocked_cids.py ~/Downloads/clusters-prod.csv
+```
+
+The tool reads only the `cluster_id` column, requires each value to match
+`[a-z0-9]{16,24}`, drops duplicates, sorts, and rewrites the region between the
+`# BEGIN BLOCKED CIDS` / `# END BLOCKED CIDS` markers. Rows with an unusable
+`cluster_id` are reported on stderr rather than silently dropped. Review the diff before
+committing — it is the only thing standing between an operator and a production cluster.
 
 ---
 
@@ -420,6 +469,7 @@ directory, and a fresh run picks up from whatever is already at the destination.
 
 | Symptom | Likely cause |
 | --- | --- |
+| `FATAL: refusing to run: ... do-not-copy list` | A bucket name contains a blocked cluster id. Intentional — see [Do-not-copy list](#do-not-copy-list). If the cluster really should be migrated, remove it from the export and regenerate. |
 | `FATAL: config.cid must be one folder name...` | `cid` contains a slash or starts with a punctuation character. |
 | `FATAL: source.endpoint must be http(s)://host[:port] without a path` | The endpoint has a path component — move it into `prefix`. |
 | `FATAL: source and destination prefixes overlap on the same endpoint` | The destination would be inside the source. Change `destination.prefix` or `cid`. |
