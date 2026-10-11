@@ -266,8 +266,14 @@ def rclone(binary, cfg, *args, output_path=None):
                            lambda: rclone_once(binary, cfg, *args, output_path=output_path))
 
 
+def rclone_command(binary, cfg, *args):
+    return [binary, "--config", str(cfg),
+            "--retries", "1", "--low-level-retries", "1",
+            "--contimeout", "5s", "--timeout", "10s", *args]
+
+
 def rclone_once(binary, cfg, *args, output_path=None):
-    command = [binary, "--config", str(cfg), *args]
+    command = rclone_command(binary, cfg, *args)
     with tempfile.TemporaryFile() as stderr:
         if output_path is None:
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=stderr)
@@ -290,7 +296,7 @@ def rclone_cat_size(binary, cfg, uri):
 
 
 def rclone_cat_size_once(binary, cfg, uri):
-    command = [binary, "--config", str(cfg), "cat", remote_path(uri, "source")]
+    command = rclone_command(binary, cfg, "cat", remote_path(uri, "source"))
     size = 0
     with tempfile.TemporaryFile() as stderr:
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr) as process:
@@ -495,12 +501,12 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
     # roughly one lookup per listed file: cheaper only when the remaining set is
     # small next to the destination (see --no-traverse in the README).
     traverse = ("--no-traverse",) if no_traverse else ()
-    command = [binary, "--config", str(cfg), "copy",
+    command = rclone_command(binary, cfg, "copy",
                remote_path(src_prefix, "source"), remote_path(dst_prefix, "destination"),
                "--files-from0", str(file_list), "--size-only", *traverse,
                "--transfers", str(parallel), "--checkers", str(max(4, parallel)),
-               "--retries", "1", "--use-json-log", "--stats", "10s",
-               "--stats-log-level", "NOTICE"]
+               "--use-json-log", "--stats", "10s",
+               "--stats-log-level", "NOTICE")
     log = run_dir / f"pass-{attempt}-rclone.jsonl"
     errors = []
     unskipped = []
