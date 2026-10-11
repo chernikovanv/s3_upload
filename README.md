@@ -39,6 +39,7 @@ restartable, shardable across machines, and must leave evidence of what happened
   - [A failing source](#a-failing-source)
 - [Security notes](#security-notes)
 - [Taking a request from Support Hub](#taking-a-request-from-support-hub)
+  - [Checking the request against a clusters reference](#checking-the-request-against-a-clusters-reference)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -753,6 +754,35 @@ customer. Unlike `s3_upload.py`, this tool needs `requests` and `cryptography`
 (`pip install requests cryptography`) and an authorized key of a service account with
 access to Support Hub. Run `--help` or read the module docstring for the full
 description and exit codes.
+
+### Checking the request against a clusters reference
+
+`tools/supporthub_get_ticket_v2.py` has the same options and behaviour as
+`supporthub_get_ticket.py`, plus one mandatory option, `--clusters-ref`: a CSV reference
+of existing (not deleted) clusters with the columns `cluster_id`, `cluster_type`,
+`cloud_id`, `organization_id`. Without the file, or if a column is missing, the tool
+does not start.
+
+```bash
+python3 tools/supporthub_get_ticket_v2.py --key sa-key.pem --sa-id <SA_ID> \
+    --ticket <TICKET_ID> --out <TICKET_ID>.json --clusters-ref clusters.csv --dry-run
+```
+
+Before changing anything, and also with `--dry-run`, the request is checked:
+
+1. The `cluster_id` from the request form must be in the reference; otherwise:
+   `cluster_id … is not in the clusters reference`.
+2. The ticket's `organization_id` must equal `organization_id` in the reference for that
+   cluster; otherwise: `request attributes failed the check: organization_id of the
+   request (…) does not match organization_id in the reference (…)`. An empty
+   `organization_id` in the reference also fails the check.
+3. The ticket carries no `cloud_id`, so `cloud_id` is not compared; it is taken from the
+   reference into the JSON.
+
+If the check fails, the ticket is not changed and the exit code is `4`. The JSON gets
+`organization_id`, `cloud_id` and a `check` block (`status`, `message`, and the values
+from the ticket and the reference). A cluster created after the reference was built
+fails as "not in the reference", so rebuild the reference before processing new tickets.
 
 ---
 
