@@ -24,6 +24,7 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Sharding](#sharding)
 - [How a run works](#how-a-run-works)
 - [Output files](#output-files)
+- [Resuming an interrupted migration](#resuming-an-interrupted-migration)
 - [Exit codes](#exit-codes)
 - [Verify-only mode](#verify-only-mode)
 - [Error handling](#error-handling)
@@ -136,6 +137,8 @@ python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclon
 | `B` | `1` | Total number of shards. Must be `> 0`. |
 | `-p`, `--parallel` | `10` | rclone `--transfers`. Checkers are set to `max(4, N)`. |
 | `--verify` | off | Compare only; copy nothing. See [Verify-only mode](#verify-only-mode). |
+| `--fast-list` | off | Pass rclone `--fast-list` to every recursive listing. Far fewer S3 requests on a large bucket; holds the listing in rclone's memory too. |
+| `--no-traverse` | off | Pass rclone `--no-traverse` to the copy. Only pays off when little is left to copy — see [Resuming](#resuming-an-interrupted-migration). |
 | `--state-dir` | `copy_s3_state_<cid>` | Where run directories are created. |
 | `--rclone` | `rclone` | rclone executable name or path. |
 
@@ -299,7 +302,8 @@ empty, the run fails with `source prefix ... contains no files`.
 7. **Up to 3 copy passes.** Each pass re-lists source and destination, computes the
    candidates (missing at the destination, or present with a different size, and not
    already skipped), and runs one `rclone copy`. Progress is printed and mirrored to
-   `progress.txt` from rclone's JSON stats.
+   `progress.txt` from rclone's JSON stats. A pass that finds nothing left to copy ends
+   the loop early rather than re-listing both sides again.
 8. **Final reconciliation.** Source and destination are listed once more, everything
    discovered across all passes is compared by size, and `failed.jsonl` is written with
    one line per object that is missing or mismatched, each with a reason.
@@ -369,6 +373,70 @@ Watching a running shard from elsewhere:
 cat copy_s3_state_<cid>/run-*/progress.txt
 tail -f copy_s3_state_<cid>/run-*/run.log
 ```
+
+---
+
+## Resuming an interrupted migration
+
+**Re-run exactly the same command.** Nothing already at the destination is uploaded
+again — that is not a flag, it is how the copy works:
+
+1. Each pass lists the source shard and the destination shard.
+2. It diffs them in memory and keeps only keys that are **absent at the destination, or
+   present with a different size**.
+3. Only those keys are written to `pass-N-files.bin` and handed to rclone via
+   `--files-from0`.
+
+An object that is already there is never named to rclone at all, so there is no
+per-object upload attempt to skip. A partially written object has the wrong size and is
+re-copied; S3 multipart semantics mean a half-finished upload is not visible in the
+listing in the first place.
+
+```bash
+# identical to the original invocation
+python3 s3_upload.py config.json 0 4 -p 32
+```
+
+If the previous run exited `1`, your `config.json` is still there — cleanup only happens
+on a clean verification. If it exited `0` the config was deleted, so restore your copy.
+
+### What resuming actually costs
+
+The transfer is already minimal, so the cost of a resumed run is **listing**, not
+copying. Both sides are listed repeatedly, and on a multi-hundred-terabyte bucket that
+dominates the wall clock. Two things reduce it:
+
+**Fewer listings.** A pass that finds nothing left to copy now stops the loop instead of
+running the remaining passes. On a resume where the first pass succeeds this drops a run
+from 8 full recursive listings to 6. The final reconciliation still lists both sides, so
+nothing goes unverified.
+
+**Cheaper listings — `--fast-list`.** rclone's default per-directory walk uses many more
+S3 requests than the recursive `ListR` strategy. `--fast-list` permits `ListR`, which the
+rclone docs recommend "if you pay for transactions and can fit your entire sync listing
+into memory". The caveat is memory: rclone buffers the whole listing, *in addition to*
+the dict this script already holds. Budget roughly 1 KB per object on the rclone side.
+
+```bash
+python3 s3_upload.py config.json 0 4 -p 32 --fast-list
+```
+
+### When to add `--no-traverse`
+
+rclone traverses the destination even when given `--files-from0` — the names act as
+filters over a walk, so a resumed run pays for rclone's own full destination listing on
+top of this script's. `--no-traverse` replaces that walk with roughly **one API call per
+file in the list**.
+
+That is a win only when the remaining set is small relative to the destination. The
+rough break-even, since a traverse costs about one `LIST` per 1000 objects:
+
+> use `--no-traverse` when *files left to copy* < *objects already at the destination* ÷ 1000
+
+So for a top-up run with a few thousand stragglers against millions of existing objects,
+`--no-traverse` helps a lot. For a resume that still has a third of the data to move it
+is actively harmful — hundreds of thousands of individual lookups instead of a few
+hundred `LIST` calls. It is off by default for that reason.
 
 ---
 

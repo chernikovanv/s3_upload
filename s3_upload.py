@@ -361,7 +361,7 @@ def parse_rclone_time(value):
 
 
 def list_shard(binary, cfg, base, a, b, run_dir, name, snapshot=False,
-               unfiltered=False):
+               unfiltered=False, fast_list=False):
     fd, filename = tempfile.mkstemp(prefix=f".{name}-", dir=run_dir)
     os.close(fd)
     listing = Path(filename)
@@ -369,8 +369,9 @@ def list_shard(binary, cfg, base, a, b, run_dir, name, snapshot=False,
     try:
         flags = ("--use-server-modtime",) if name == "source" else ("--no-modtime",)
         hash_filter = () if unfiltered else ("--hash-filter", f"{a}/{b}")
+        recursive = ("--fast-list",) if fast_list else ()
         rclone(binary, cfg, "lsjson", remote_path(base, name), "--recursive",
-               "--files-only", "--no-mimetype", *flags, *hash_filter,
+               "--files-only", "--no-mimetype", *flags, *hash_filter, *recursive,
                output_path=listing)
         with listing.open(encoding="utf-8") as stream:
             for line_number, item in lsjson_items(stream, name):
@@ -445,15 +446,20 @@ def skip_source_object(run_dir, skipped, record, error, stage, reason):
 
 
 def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, attempt,
-               completed=0, total=None, skipped=None):
+               completed=0, total=None, skipped=None, no_traverse=False):
     # files-from0 overrides hash-filter. Its input comes only from a shard-filtered
     # listing, so rclone's native hash function defines the shard for every pass.
     file_list = run_dir / f"pass-{attempt}-files.bin"
     atomic_write(file_list, b"".join(record["key"].encode("utf-8") + b"\0"
                                       for record in records))
+    # rclone traverses the destination even with --files-from0, so a resumed run
+    # pays for a second full listing per pass. --no-traverse replaces that with
+    # roughly one lookup per listed file: cheaper only when the remaining set is
+    # small next to the destination (see --no-traverse in the README).
+    traverse = ("--no-traverse",) if no_traverse else ()
     command = [binary, "--config", str(cfg), "copy",
                remote_path(src_prefix, "source"), remote_path(dst_prefix, "destination"),
-               "--files-from0", str(file_list), "--size-only",
+               "--files-from0", str(file_list), "--size-only", *traverse,
                "--transfers", str(parallel), "--checkers", str(max(4, parallel)),
                "--retries", "1", "--use-json-log", "--stats", "10s",
                "--stats-log-level", "NOTICE"]
@@ -624,7 +630,7 @@ def upload_metadata(binary, cfg, local, remote, run_dir):
 def verify(args, run_dir, cfg, dst_prefix, source, destination=None, skipped=None):
     if destination is None:
         destination = list_shard(args.rclone, cfg, dst_prefix, args.a, args.b,
-                                 run_dir, "destination")
+                                 run_dir, "destination", fast_list=args.fast_list)
     missing = [source[key] for key in source.keys() - destination.keys()]
     wrong_size = [(source[key], destination[key])
                   for key in source.keys() & destination.keys()
@@ -734,14 +740,16 @@ def run_impl(args, started, stack):
     print("Destination PUT, GET, LS and cleanup: OK", flush=True)
     print(f"Listing source shard under {src_prefix}", flush=True)
     initial_source = list_shard(args.rclone, cfg, src_prefix, args.a, args.b,
-                                run_dir, "source", snapshot=True)
+                                run_dir, "source", snapshot=True,
+                                fast_list=args.fast_list)
     print(f"Source listing: {len(initial_source)} objects", flush=True)
     source_probe = initial_source
     if not source_probe:
         # An empty shard is valid. Check the unfiltered source only for prefix
         # existence and a GET probe; do not include its files in this shard.
         source_probe = list_shard(args.rclone, cfg, src_prefix, args.a, args.b,
-                                  run_dir, "source", unfiltered=True)
+                                  run_dir, "source", unfiltered=True,
+                                  fast_list=args.fast_list)
         if not source_probe:
             raise RuntimeError(f"source prefix {src_prefix} contains no files; check the prefix")
     skipped = {}
@@ -767,9 +775,9 @@ def run_impl(args, started, stack):
         try:
             current = (initial_source if attempt == 1 else
                        list_shard(args.rclone, cfg, src_prefix, args.a, args.b,
-                                  run_dir, "source"))
+                                  run_dir, "source", fast_list=args.fast_list))
             target = list_shard(args.rclone, cfg, dst_prefix, args.a, args.b,
-                                run_dir, "destination")
+                                run_dir, "destination", fast_list=args.fast_list)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"ERROR [{attempt}/3] listing: {exc}", file=sys.stderr, flush=True)
             continue
@@ -787,22 +795,27 @@ def run_impl(args, started, stack):
         print(progress, flush=True)
         atomic_write(run_dir / "progress.txt", (progress + "\n").encode())
         if not candidates:
-            print(f"Pass {attempt}/3: nothing to copy", flush=True)
-            continue
+            # Everything eligible is already at the destination. Further passes
+            # would only re-list both sides, which is the expensive part on a
+            # large bucket; the final reconciliation below still re-checks.
+            print(f"Pass {attempt}/3: nothing to copy; skipping remaining passes",
+                  flush=True)
+            break
         print(f"Pass {attempt}/3: {len(candidates)} objects to copy", flush=True)
         try:
             copy_batch(args.rclone, cfg, src_prefix, dst_prefix, candidates,
-                       args.parallel, run_dir, attempt, completed, len(discovered), skipped)
+                       args.parallel, run_dir, attempt, completed, len(discovered),
+                       skipped, args.no_traverse)
         except (OSError, RuntimeError, ValueError) as exc:
             copy_errors[attempt] = str(exc)
             print(f"ERROR [{attempt}/3] {exc}", file=sys.stderr, flush=True)
 
     final_source = list_shard(args.rclone, cfg, src_prefix, args.a, args.b,
-                              run_dir, "source")
+                              run_dir, "source", fast_list=args.fast_list)
     discovered.update({key: record for key, record in final_source.items()
                        if eligible(record, cutoff)})
     final_target = list_shard(args.rclone, cfg, dst_prefix, args.a, args.b,
-                              run_dir, "destination")
+                              run_dir, "destination", fast_list=args.fast_list)
     present = {key for key, record in discovered.items()
                if key in final_target and final_target[key]["size"] == record["size"]}
     missing = []
@@ -1776,6 +1789,14 @@ def main():
     parser.add_argument("-p", "--parallel", type=int, default=10)
     parser.add_argument("--verify", action="store_true",
                         help="only compare this shard and report time ranges of missing files")
+    parser.add_argument("--fast-list", action="store_true",
+                        help="list with rclone --fast-list: far fewer S3 requests on a "
+                             "large bucket, at the cost of holding the listing in "
+                             "rclone's memory as well as this script's")
+    parser.add_argument("--no-traverse", action="store_true",
+                        help="copy with rclone --no-traverse: skips rclone's own "
+                             "destination listing in favour of one lookup per copied "
+                             "file; only pays off when little is left to copy")
     parser.add_argument("--state-dir", type=Path,
                         help="state directory (default: copy_s3_state_<cid>)")
     parser.add_argument("--rclone", default="rclone", help="rclone executable")
