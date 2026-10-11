@@ -634,3 +634,10 @@ description and exit codes.
 | Exit `1` with ranges clustered in one window | A source-side incident during that window. Re-run the shard; objects that are still absent will show up again. |
 | Exit `1`, and `skipped.jsonl` holds only `.json` keys | The source cannot serve those sidecars. The data itself copied fine; decide per backup whether a missing `metadata.json` / `*_backup_stop_sentinel.json` makes it unrestorable. |
 | `FATAL: source GET returned N bytes for ...` | A short read on **non-JSON** data — the source is returning truncated objects. Not skipped on purpose; investigate before copying. |
+
+
+## Layout
+~           - home dir
+|- s3_clone - repo with scripts
+|- sec      - settings for scrips
+|- exports  - runtime export confis
