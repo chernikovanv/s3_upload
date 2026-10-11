@@ -26,6 +26,7 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Exit codes](#exit-codes)
 - [Verify-only mode](#verify-only-mode)
 - [Error handling](#error-handling)
+  - [Unreadable source objects](#unreadable-source-objects)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 
@@ -42,6 +43,8 @@ restartable, shardable across machines, and must leave evidence of what happened
   data, as migration metadata, and reads it back to confirm it landed.
 - Copies in up to **3 passes**, re-listing both sides between passes so each pass only
   transfers what is still missing or has the wrong size.
+- Tolerates a flaky source: objects it cannot serve are recorded and stepped over rather
+  than aborting the run — see [Unreadable source objects](#unreadable-source-objects).
 - Verifies the result by comparing full source and destination listings, and groups the
   discrepancies into time ranges by `LastModified` so you can see *when* the gaps are.
 - Deletes the local credential files once verification passes.
@@ -235,7 +238,9 @@ empty, the run fails with `source prefix ... contains no files`.
    - destination `PUT` → `GET` (content compared) → `LS` (exact key) → `DELETE` of a
      random probe object under `__migration__/`;
    - source `GET`: the **smallest** object in the shard is streamed and its byte count
-     compared with the listed size — nothing is staged on disk.
+     compared with the listed size — nothing is staged on disk. If that object turns out
+     to be unreadable and skippable, it is recorded and the next smallest is probed
+     instead (up to 5), so one broken sidecar cannot abort the run.
 4. **Snapshot the source listing** to `initial_source_listing.json`.
 5. **Upload metadata** and read it back.
 6. **Set the cutoff** at `start + 10 minutes`. Only objects whose `LastModified` is at or
@@ -275,7 +280,7 @@ Everything lives in
 | `pass-N-rclone.jsonl` | Raw rclone JSON log for pass *N*. |
 | `pass-N-files.bin` | NUL-separated key list handed to rclone for pass *N*. |
 | `initial_source_listing.json` | `lsjson` snapshot of the shard taken before any copying. |
-| `skipped_500.jsonl` | Objects skipped because the **source** returned HTTP 500 on `GetObject`. |
+| `skipped.jsonl` | Objects the **source** could not serve: `{source, key, stage, reason, error, time}`. |
 | `failed.jsonl` | Final per-object failures: `{source, destination, error}`. |
 | `verification.json` | Structured verification report (see below). |
 | `rclone.conf` | Generated remotes, **contains credentials**. Deleted on success. |
@@ -297,9 +302,17 @@ Everything lives in
   ],
   "ranges": [
     { "start": "2026-02-11T03:10:04+00:00", "end": "2026-02-11T04:40:12+00:00", "count": 412 }
+  ],
+  "skipped_source_reads": [
+    { "source": "s3://.../metadata.json", "reason": "unreadable JSON",
+      "stage": "copy pass 1", "error": "Failed to copy: AccessDenied: StatusCode: 403" }
   ]
 }
 ```
+
+`skipped_source_reads` is informational. Those objects are **also** counted in
+`missing_files` above, so they still drive the exit code — see
+[Unreadable source objects](#unreadable-source-objects).
 
 Watching a running shard from elsewhere:
 
@@ -346,12 +359,37 @@ discrepancies, exactly like a full run.
 `TooManyRequests`, `connection reset`, `connection timed out`, `i/o timeout`,
 `unexpected EOF`. Anything else fails immediately — a `403` is not worth three attempts.
 
-**Source 500 on `GetObject`.** Some source providers have permanently unreadable
-objects. When `GetObject` returns HTTP 500, the object is logged to `skipped_500.jsonl`,
-excluded from later passes, and reported in `failed.jsonl` with the reason
-`source GET 500; skipped in this run`. The run continues instead of aborting. If the
-source GET *probe* hits this, the run continues too, with a warning — the probe picks
-the smallest object, which may well be the broken one.
+### Unreadable source objects
+
+Some source providers have objects they can list but cannot serve. Two categories never
+abort the run:
+
+| Category | Matches | Tolerated errors |
+| --- | --- | --- |
+| `source GET 500` | any object | HTTP 500 on `GetObject` |
+| `unreadable JSON` | any key ending in `.json` (case-insensitive) — `metadata.json`, `*_backup_stop_sentinel.json`, and any other sidecar | **any** read error, plus a short/overlong read |
+
+Everything else still fails the way it always did: a `403` on `part_001.tar.lz4`, or a
+byte count that disagrees with the listing on real backup data, aborts.
+
+When an object falls into either category it is appended to `skipped.jsonl`, excluded
+from the remaining copy passes, and reported in `failed.jsonl` with its reason. This
+applies at both stages:
+
+- **the source GET probe**, which streams the smallest object in the shard. That is
+  almost always a sidecar JSON, so an unreadable one used to kill the run with exit `2`
+  before anything was copied. The probe now records it and moves on to the next smallest
+  object, trying up to 5, so `GET` is still genuinely validated against real data.
+- **a copy pass.** If `rclone copy` exits non-zero but *every* error it reported was
+  skippable, the pass is not treated as a failure — the run logs
+  `all N errors were skippable source reads; continuing` and proceeds. A single
+  non-skippable error still raises.
+
+Skipped objects remain **discrepancies**: they are missing at the destination, so they
+are counted in `verification.json`, the run exits `1`, and the local credential files are
+*not* deleted. The run is never aborted by them, but it never claims success either —
+an unreadable `*_backup_stop_sentinel.json` may mean that backup cannot be restored, so
+that has to stay visible.
 
 **Objects that vanish.** An object listed early and gone by the final listing is
 reported as `no longer in source`, not as a failure of the copy.
@@ -391,3 +429,5 @@ directory, and a fresh run picks up from whatever is already at the destination.
 | `rclone was not found and apt-get is unavailable` | Install rclone manually, or pass `--rclone /path/to/rclone`. |
 | `installing rclone requires root or passwordless sudo` | Install rclone yourself; the script will not prompt for a password. |
 | Exit `1` with ranges clustered in one window | A source-side incident during that window. Re-run the shard; objects that are still absent will show up again. |
+| Exit `1`, and `skipped.jsonl` holds only `.json` keys | The source cannot serve those sidecars. The data itself copied fine; decide per backup whether a missing `metadata.json` / `*_backup_stop_sentinel.json` makes it unrestorable. |
+| `FATAL: source GET returned N bytes for ...` | A short read on **non-JSON** data — the source is returning truncated objects. Not skipped on purpose; investigate before copying. |

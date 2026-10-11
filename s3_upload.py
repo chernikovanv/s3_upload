@@ -192,7 +192,7 @@ def attach_run_log(stack, run_dir):
     print(f"Log: {path.resolve()}", flush=True)
     print("State files: operations.log — operation attempts; "
           "pass-N-rclone.jsonl — raw copy logs; progress.txt — latest progress; "
-          "skipped_500.jsonl — skipped source GET errors; "
+          "skipped.jsonl — unreadable source objects; "
           "failed.jsonl and verification.json — final reports", flush=True)
 
 
@@ -382,18 +382,36 @@ def source_get_500(error):
                 and "GetObject" in str(error))
 
 
-def skip_source_object(run_dir, skipped, record, error, stage):
+def optional_json(key):
+    """Sidecar JSON such as metadata.json or *_backup_stop_sentinel.json.
+
+    Some sources fail to serve these small objects. Report them, but never abort
+    the run over one; the bulk data is what matters.
+    """
+    return key.lower().endswith(".json")
+
+
+def skip_reason(key, error):
+    """Why this object may be skipped instead of failing the run, or None."""
+    if source_get_500(error):
+        return "source GET 500"
+    if optional_json(key):
+        return "unreadable JSON"
+    return None
+
+
+def skip_source_object(run_dir, skipped, record, error, stage, reason):
     key = record["key"]
     if key in skipped:
         return
-    item = {"source": record["uri"], "key": key, "stage": stage,
+    item = {"source": record["uri"], "key": key, "stage": stage, "reason": reason,
             "error": str(error), "time": now().isoformat()}
     skipped[key] = item
-    path = run_dir / "skipped_500.jsonl"
+    path = run_dir / "skipped.jsonl"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as stream:
         stream.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(f"SKIPPED source GET 500: {record['uri']}; details: {path}",
+    print(f"SKIPPED {reason}: {record['uri']}; details: {path}",
           file=sys.stderr, flush=True)
 
 
@@ -412,6 +430,7 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
                "--stats-log-level", "NOTICE"]
     log = run_dir / f"pass-{attempt}-rclone.jsonl"
     errors = []
+    unskipped = []
     skipped = {} if skipped is None else skipped
     records_by_key = {record["key"]: record for record in records}
     total = len(records) + completed if total is None else total
@@ -442,14 +461,23 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
                     message = event.get("msg", line.strip())
                     errors.append(str(message))
                     key = event.get("object")
-                    if source_get_500(message) and key in records_by_key:
-                        skip_source_object(run_dir, skipped, records_by_key[key],
-                                           message, f"copy pass {attempt}")
+                    record = records_by_key.get(key) if isinstance(key, str) else None
+                    reason = skip_reason(key, message) if record else None
+                    if reason:
+                        skip_source_object(run_dir, skipped, record, message,
+                                           f"copy pass {attempt}", reason)
+                    else:
+                        unskipped.append(str(message))
                     print(f"ERROR [{attempt}/3] {message}", file=sys.stderr, flush=True)
             returncode = process.wait()
     if returncode:
-        raise RuntimeError(f"rclone copy exited {returncode}; "
-                           f"details: {log}; last error: {(errors[-1] if errors else 'unknown')[-1000:]}")
+        # A non-zero exit caused only by skippable source reads is not a pass failure:
+        # those objects are already recorded and excluded from the remaining passes.
+        if unskipped or not errors:
+            raise RuntimeError(f"rclone copy exited {returncode}; "
+                               f"details: {log}; last error: {(errors[-1] if errors else 'unknown')[-1000:]}")
+        print(f"Pass {attempt}/3: rclone exited {returncode}; all {len(errors)} errors "
+              f"were skippable source reads; continuing", flush=True)
     return last_transferred
 
 
@@ -474,25 +502,34 @@ def format_range(item):
     return f"{start:%Y-%m-%d %H:%M}-{end:%Y-%m-%d %H:%M}"
 
 
-def validate_source(binary, cfg, records, run_dir, skipped=None):
-    """Stream the smallest object in this shard to test GET without staging it."""
+def validate_source(binary, cfg, records, run_dir, skipped=None, attempts=5):
+    """Stream the smallest readable object in this shard to test GET without staging it.
+
+    The smallest object is usually a sidecar JSON, so a source that cannot serve
+    those would otherwise fail the probe and abort a run whose bulk data is fine.
+    Skippable objects are recorded and the next smallest one is probed instead.
+    """
     if not records:
         print("Source LS: OK; shard is empty, so GET cannot be checked", flush=True)
-        return
-    record = min(records.values(), key=lambda item: item["size"])
-    operation_log(cfg, f"Source GET probe: {record['uri']}; expected size={record['size']} bytes")
-    try:
-        size = rclone_cat_size(binary, cfg, record["uri"])
-    except RuntimeError as exc:
-        if not source_get_500(exc):
-            raise
-        skip_source_object(run_dir, {} if skipped is None else skipped,
-                           record, exc, "source GET probe")
-        return False
-    if size != record["size"]:
-        raise RuntimeError(f"source GET returned {size} bytes for {record['uri']}; "
-                           f"listing reported {record['size']}")
-    return True
+        return None
+    skipped = {} if skipped is None else skipped
+    candidates = sorted(records.values(), key=lambda item: item["size"])
+    for record in candidates[:attempts]:
+        operation_log(cfg, f"Source GET probe: {record['uri']}; "
+                      f"expected size={record['size']} bytes")
+        try:
+            size = rclone_cat_size(binary, cfg, record["uri"])
+            if size != record["size"]:
+                raise RuntimeError(f"source GET returned {size} bytes for {record['uri']}; "
+                                   f"listing reported {record['size']}")
+        except RuntimeError as exc:
+            reason = skip_reason(record["key"], exc)
+            if not reason:
+                raise
+            skip_source_object(run_dir, skipped, record, exc, "source GET probe", reason)
+            continue
+        return True
+    return False
 
 
 def validate_destination(binary, cfg, dest_prefix, run_dir):
@@ -555,7 +592,7 @@ def upload_metadata(binary, cfg, local, remote, run_dir):
         download.unlink(missing_ok=True)
 
 
-def verify(args, run_dir, cfg, dst_prefix, source, destination=None):
+def verify(args, run_dir, cfg, dst_prefix, source, destination=None, skipped=None):
     if destination is None:
         destination = list_shard(args.rclone, cfg, dst_prefix, args.a, args.b,
                                  run_dir, "destination")
@@ -585,11 +622,21 @@ def verify(args, run_dir, cfg, dst_prefix, source, destination=None):
              "count": item["count"]}
             for item in ranges
         ],
+        # Unreadable at the source, so they stay counted above as discrepancies.
+        "skipped_source_reads": [
+            {"source": item["source"], "reason": item["reason"],
+             "stage": item["stage"], "error": item["error"]}
+            for item in sorted((skipped or {}).values(),
+                               key=lambda item: item["source"])
+        ],
     }
     atomic_write(report, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode())
     print(f"Checked shard {args.a}/{args.b}: {len(source)} source files, "
           f"{len(missing)} missing, {len(wrong_size)} with different size. "
           f"Report: {report}", flush=True)
+    if skipped:
+        print(f"Unreadable at the source and still counted above: {len(skipped)}",
+              flush=True)
     if ranges:
         print("Discrepancy time ranges (UTC):", flush=True)
     for item in ranges:
@@ -672,9 +719,10 @@ def run_impl(args, started, stack):
     if validate_source(args.rclone, cfg, source_probe, run_dir, skipped):
         print("Source GET: OK", flush=True)
     else:
-        print("Source GET probe returned 500; continuing with other objects", flush=True)
+        print("Source GET probe could not read any of the smallest objects; "
+              "continuing with the rest of the shard", flush=True)
     if args.verify:
-        result = verify(args, run_dir, cfg, dst_prefix, initial_source)
+        result = verify(args, run_dir, cfg, dst_prefix, initial_source, skipped=skipped)
         if result == 0:
             cleanup_local_secrets(args.config, cfg, metadata_file)
         return result
@@ -733,7 +781,8 @@ def run_impl(args, started, stack):
         record = discovered[key]
         target = final_target.get(key)
         if key in skipped:
-            error = "source GET 500; skipped in this run: " + skipped[key]["error"]
+            error = (f"{skipped[key]['reason']}; skipped in this run: "
+                     f"{skipped[key]['error']}")
         elif target:
             error = (f"size mismatch: source {record['size']} bytes, "
                      f"destination {target['size']} bytes")
@@ -755,7 +804,7 @@ def run_impl(args, started, stack):
                 f"Remaining: {len(missing)}")
     print(progress, flush=True)
     atomic_write(run_dir / "progress.txt", (progress + "\n").encode())
-    result = verify(args, run_dir, cfg, dst_prefix, discovered, final_target)
+    result = verify(args, run_dir, cfg, dst_prefix, discovered, final_target, skipped)
     if result == 0:
         cleanup_local_secrets(args.config, cfg, metadata_file)
     return result
