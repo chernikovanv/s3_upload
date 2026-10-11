@@ -480,6 +480,10 @@ discrepancies, exactly like a full run.
 `TooManyRequests`, `connection reset`, `connection timed out`, `i/o timeout`,
 `unexpected EOF`. Anything else fails immediately — a `403` is not worth three attempts.
 
+All rclone commands use `--retries 1 --low-level-retries 1 --contimeout 5s --timeout 10s`.
+The timeouts limit connection setup and idle I/O, not total execution time; Python-level
+retries still apply.
+
 ### Unreadable source objects
 
 Some source providers have objects they can list but cannot serve. Two categories never
@@ -514,11 +518,9 @@ that has to stay visible.
 
 ### A failing source
 
-rclone is given `--retries 1`, so a pass walks the file list exactly once. When the
-source is returning `500 InternalError` broadly, every object fails — and fails *slowly*,
-because the AWS SDK's rate limiter throttles retries (`failed to get rate limit token,
-retry quota exceeded`). With 100k objects left that is days of work at zero throughput,
-while `--stats 10s` keeps printing. It looks like a hang.
+Each copy pass uses `--retries 1` and `--low-level-retries 1`. Even without internal
+retry loops, walking a large list of unavailable objects can take a long time at zero
+throughput while `--stats 10s` keeps printing.
 
 Two guards bound it:
 
