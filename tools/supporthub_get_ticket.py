@@ -36,6 +36,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -84,7 +86,7 @@ def iam_token(key_path, sa_id, key_id=None):
         padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
         hashes.SHA256(),
     )
-    response = requests.post(IAM_URL, json={"jwt": f"{signing_input}.{b64url(signature)}"}, timeout=30)
+    response = requests.post(IAM_URL, json={"jwt": f"{signing_input}.{b64url(signature)}"}, timeout=30, verify=False)
     if response.status_code != 200:
         raise SystemExit(f"IAM: HTTP {response.status_code} {mask(response.text[:200])}")
     return response.json()["iamToken"]
@@ -140,7 +142,7 @@ def write_json(data, out):
 
 def get_ticket(token, ticket_id):
     response = requests.get(f"{API_BASE}/tickets/{ticket_id}",
-                            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+                            headers={"Authorization": f"Bearer {token}"}, timeout=15, verify=False)
     if response.status_code != 200:
         raise SystemExit(f"get ticket: HTTP {response.status_code} {mask(response.text[:300])}")
     return response.json()
@@ -152,6 +154,7 @@ def take_on(token, ticket):
         json={"ticketId": ticket["id"], "action": {"type": "take-on", "payload": {}}},
         headers={"Authorization": f"Bearer {token}"},
         timeout=15,
+        verify=False,
     )
     if response.status_code != 200:
         raise SystemExit(f"take-on: HTTP {response.status_code} {mask(response.text[:300])}")
@@ -164,6 +167,7 @@ def add_comment(token, ticket_id, text):
         json={"ticketId": ticket_id, "message": text, "type": MESSAGE_TYPE, "attachmentIds": [], "summoned": []},
         headers={"Authorization": f"Bearer {token}", "Idempotency-Key": str(uuid.uuid4())},
         timeout=15,
+        verify=False,
     )
     if response.status_code not in (200, 201):
         raise SystemExit(f"add comment: HTTP {response.status_code} {mask(response.text[:300])}")
