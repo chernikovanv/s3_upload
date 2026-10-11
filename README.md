@@ -139,7 +139,7 @@ python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclon
 | `-p`, `--parallel` | `10` | rclone `--transfers`. Checkers are set to `max(4, N)`. |
 | `--verify` | off | Compare only; copy nothing. See [Verify-only mode](#verify-only-mode). |
 | `--max-errors` | `100` | Abort a copy pass once the source is clearly broken, instead of grinding through every remaining object. `0` disables. See [A failing source](#a-failing-source). |
-| `--stall-timeout` | `300` | Kill rclone if it prints nothing for this many seconds. `--stats 10s` should print continuously, so silence means it is wedged. |
+| `--stall-timeout` | `28800` (8 h) | Kill rclone if it prints nothing for this many seconds. Must outlast the silent destination listing `rclone copy` does first. `0` never kills. |
 | `--fast-list` | off | Pass rclone `--fast-list` to every recursive listing. Far fewer S3 requests on a large bucket; holds the listing in rclone's memory too. |
 | `--no-traverse` | off | Pass rclone `--no-traverse` to the copy. Only pays off when little is left to copy — see [Resuming](#resuming-an-interrupted-migration). |
 | `--state-dir` | `copy_s3_state_<cid>` | Where run directories are created. |
@@ -533,9 +533,18 @@ The second condition is the one that catches a `500` storm, because a `500` on
 `GetObject` is individually skippable — without it, a source failing every object would
 never trip the cap.
 
-**`--stall-timeout` (default 300s)** kills rclone if it prints nothing at all for that
-long. Since `--stats 10s` prints continuously while rclone lives, silence means wedged
-rather than slow.
+**`--stall-timeout` (default 8 hours)** kills rclone if it prints nothing at all for that
+long.
+
+The default is deliberately generous. `rclone copy` **traverses the destination before
+transferring anything** — `--files-from0` filters a walk rather than replacing it — and
+that phase produces no output at all. On a multi-hundred-terabyte bucket it can run for
+hours, so a short timeout reads a perfectly healthy listing as a hang and kills the run.
+A 300-second default did exactly that in the field.
+
+Tune it to your bucket: the timeout only has to exceed one full destination listing. Set
+`--stall-timeout 0` to disable the kill entirely and wait forever — you keep
+`--max-errors`, which is the guard that actually catches a failing source.
 
 Either way rclone and anything it spawned are killed as a process group, the pass is
 recorded as failed, and the run continues to the next pass and then to the final report —
@@ -581,7 +590,7 @@ directory, and a fresh run picks up from whatever is already at the destination.
 | `destination LS did not show ...` | Destination is eventually consistent, or the credentials can `PUT` but not `LIST`. |
 | `probe deletion failed` | Destination credentials lack `DeleteObject`. A stray probe object is left under `__migration__/`. |
 | Run appears to hang at `Speed: 0.00 MiB/s` with errors climbing | A source-side `500` storm. Since the guards landed this aborts the pass in ~2 minutes; on an older copy of the script it would grind for days. See [A failing source](#a-failing-source). |
-| `rclone copy aborted: ... no output for 300s` | rclone wedged and was killed. Check `pass-N-rclone.jsonl` for the last thing it did. |
+| `rclone copy aborted: ... rclone was killed as wedged` | rclone printed nothing for `--stall-timeout`. If the destination listing legitimately takes that long, raise it or pass `--stall-timeout 0`; otherwise check `pass-N-rclone.jsonl` for the last thing it did. |
 | `rclone was not found and apt-get is unavailable` | Install rclone manually, or pass `--rclone /path/to/rclone`. |
 | `installing rclone requires root or passwordless sudo` | Install rclone yourself; the script will not prompt for a password. |
 | Exit `1` with ranges clustered in one window | A source-side incident during that window. Re-run the shard; objects that are still absent will show up again. |

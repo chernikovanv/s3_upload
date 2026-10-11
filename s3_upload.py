@@ -452,6 +452,11 @@ def skip_source_object(run_dir, skipped, record, error, stage, reason):
 # as a broken source rather than one slow object.
 ZERO_PROGRESS_GRACE = 120
 
+# How long rclone may print nothing before it is treated as wedged. rclone copy
+# traverses the destination before transferring anything and stays silent while
+# it does, so on a large bucket this has to outlast a full listing.
+STALL_TIMEOUT = 8 * 60 * 60
+
 
 def pump(stream, lines):
     """Feed a subprocess stream into a queue so the reader can time out."""
@@ -479,7 +484,7 @@ def kill_group(process):
 
 def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, attempt,
                completed=0, total=None, skipped=None, no_traverse=False,
-               stall_timeout=300, max_errors=100):
+               stall_timeout=STALL_TIMEOUT, max_errors=100):
     # files-from0 overrides hash-filter. Its input comes only from a shard-filtered
     # listing, so rclone's native hash function defines the shard for every pass.
     file_list = run_dir / f"pass-{attempt}-files.bin"
@@ -516,12 +521,14 @@ def copy_batch(binary, cfg, src_prefix, dst_prefix, records, parallel, run_dir, 
             reader.start()
             while True:
                 try:
-                    # --stats 10s makes rclone print continuously while it lives,
-                    # so a long silence means it is wedged rather than slow.
-                    line = lines.get(timeout=stall_timeout)
+                    # Silence is only a hang signal once it outlasts the initial
+                    # destination traversal, which prints nothing. 0 waits forever.
+                    line = lines.get(timeout=stall_timeout or None)
                 except queue.Empty:
-                    aborted = (f"no output for {stall_timeout}s while --stats 10s "
-                               f"should be printing; rclone was killed")
+                    aborted = (f"no output for {stall_timeout}s "
+                               f"({stall_timeout / 3600:.1f}h); rclone was killed as "
+                               f"wedged. Raise or disable --stall-timeout if the "
+                               f"destination listing legitimately takes longer")
                     break
                 except KeyboardInterrupt:
                     # rclone runs in its own session, so Ctrl-C does not reach it.
@@ -1869,9 +1876,11 @@ def main():
                         help="abort a copy pass after this many errors that cannot be "
                              "skipped, instead of grinding through every remaining "
                              "object on a failing source (0 disables; default: 100)")
-    parser.add_argument("--stall-timeout", type=int, default=300,
-                        help="kill rclone if it prints nothing for this many seconds; "
-                             "--stats 10s should print continuously (default: 300)")
+    parser.add_argument("--stall-timeout", type=int, default=STALL_TIMEOUT,
+                        help="kill rclone if it prints nothing for this many seconds. "
+                             "Must outlast the destination listing that rclone copy "
+                             "does first, which is silent. 0 never kills "
+                             f"(default: {STALL_TIMEOUT} = 8h)")
     parser.add_argument("--fast-list", action="store_true",
                         help="list with rclone --fast-list: far fewer S3 requests on a "
                              "large bucket, at the cost of holding the listing in "
@@ -1890,8 +1899,8 @@ def main():
         parser.error("require -p > 0")
     if args.max_errors < 0:
         parser.error("require --max-errors >= 0")
-    if args.stall_timeout <= 0:
-        parser.error("require --stall-timeout > 0")
+    if args.stall_timeout < 0:
+        parser.error("require --stall-timeout >= 0")
     try:
         ensure_rclone(args.rclone)
         return run(args, started)
