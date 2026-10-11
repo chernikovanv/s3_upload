@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy S3 objects: python3 copy_s3_shard.py config.json [A B] [-p 10].
+"""Export S3 backups: python3 s3_upload.py config.json [A B] [-p 10] [--engine walg].
 
 S3 provides LastModified, not the original creation time of an object.
 """
@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -68,23 +69,21 @@ def bucket(value):
     return urlsplit(value).netloc
 
 
-def blocked_cids_in(name):
-    """Cluster ids from the do-not-copy list that occur in this bucket name.
-
-    BLOCKED_CIDS is embedded at the bottom of this file so the protection cannot
-    be lost by copying the script without a sidecar list.
-    """
+def blocked_cids_in(name, blocked=None):
+    """Cluster ids from the do-not-copy list that occur in this bucket name."""
+    blocked = load_blocked_cids() if blocked is None else blocked
     lowered = name.lower()
     windows = {lowered[start:start + size]
-               for size in BLOCKED_CID_LENGTHS
+               for size in {len(cid) for cid in blocked}
                for start in range(len(lowered) - size + 1)}
-    return sorted(windows & BLOCKED_CIDS)
+    return sorted(windows & blocked)
 
 
 def check_not_blocked(config):
+    blocked = load_blocked_cids()
     for side in ("source", "destination"):
         name = bucket(config[side]["prefix"])
-        found = blocked_cids_in(name)
+        found = blocked_cids_in(name, blocked)
         if found:
             raise ValueError(
                 f"refusing to run: {side} bucket {name!r} belongs to a cluster on "
@@ -94,6 +93,10 @@ def check_not_blocked(config):
 def read_config(path):
     with path.open(encoding="utf-8") as stream:
         config = json.load(stream)
+    return validate_config(config)
+
+
+def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("JSON root must be an object")
     cid = required(config, "cid", "config")
@@ -214,7 +217,7 @@ class HumanLog:
         self.flush()
 
 
-def attach_run_log(stack, run_dir):
+def attach_run_log(stack, run_dir, engine="rclone"):
     path = run_dir / "run.log"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     stream = stack.enter_context(os.fdopen(fd, "a", encoding="utf-8"))
@@ -225,10 +228,15 @@ def attach_run_log(stack, run_dir):
     stack.callback(stdout.finish)
     stack.callback(stderr.finish)
     print(f"Log: {path.resolve()}", flush=True)
-    print("State files: operations.log — operation attempts; "
-          "pass-N-rclone.jsonl — raw copy logs; progress.txt — latest progress; "
-          "skipped.jsonl — unreadable source objects; "
-          "failed.jsonl and verification.json — final reports", flush=True)
+    if engine == "walg":
+        print("State files: operations.log — storage operations; "
+              "walg-result.json — root results and destination backup lists; "
+              "run.log — WAL-G output and run events", flush=True)
+    else:
+        print("State files: operations.log — operation attempts; "
+              "pass-N-rclone.jsonl — raw copy logs; progress.txt — latest progress; "
+              "skipped.jsonl — unreadable source objects; "
+              "failed.jsonl and verification.json — final reports", flush=True)
 
 
 def operation_log(cfg, message):
@@ -783,6 +791,227 @@ def cleanup_local_secrets(*paths):
                            "; ".join(errors))
 
 
+WALG_BINARIES = {
+    "postgresql": "wal-g",
+    "mysql": "wal-g-mysql",
+    "mongodb": "wal-g-mongo",
+    "redis": "wal-g-redis",
+    "greenplum": "wal-g-gp",
+}
+WALG_ENV_ALLOW = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+def ensure_walg(config, override=None):
+    kind = config["cluster_type"]
+    if kind not in WALG_BINARIES:
+        raise ValueError(f"WAL-G mode does not support {kind}; use --engine rclone")
+    binary = override or WALG_BINARIES[kind]
+    resolved = shutil.which(binary)
+    if resolved is None:
+        raise RuntimeError(f"WAL-G executable was not found: {binary}; install a version supporting "
+                           "copy --backup-name LATEST or supply --walg PATH")
+    return resolved
+
+
+def discover_walg_roots(binary, cfg, src_prefix, kind):
+    """Walk directory prefixes only, pruning backup payloads and GP segments."""
+    pending = [""]
+    roots = []
+    while pending:
+        relative = pending.pop()
+        listing = json.loads(rclone(binary, cfg, "lsjson", remote_path(src_prefix + relative, "source"),
+                                    "--dirs-only", "--no-modtime", "--no-mimetype"))
+        if not isinstance(listing, list):
+            raise ValueError("source directory listing must be a JSON array")
+        names = []
+        for item in listing:
+            name = item.get("Path") if isinstance(item, dict) else None
+            if not isinstance(name, str):
+                raise ValueError("source directory listing has no Path")
+            name = name.rstrip("/")
+            if not name or name in (".", "..") or "/" in name:
+                raise ValueError("source directory listing contains an invalid path segment")
+            names.append(name)
+        if "basebackups_005" in names:
+            roots.append(relative)
+            continue
+        for name in sorted(set(names), reverse=True):
+            if name == "__migration__" or (kind == "greenplum" and name == "segments_005"):
+                continue
+            pending.append(relative + name + "/")
+    if not roots:
+        raise RuntimeError(f"no WAL-G backup roots found under {src_prefix}; expected basebackups_005/")
+    return sorted(roots)
+
+
+def make_walg_config(path, side, storage_prefix, kind, parallel):
+    scheme, host = endpoint(side["endpoint"], "WAL-G endpoint")
+    config = {
+        "AWS_ENDPOINT": f"{scheme}://{host}",
+        "AWS_S3_FORCE_PATH_STYLE": "true",
+        "AWS_REGION": side.get("region") or "us-east-1",
+        "AWS_ACCESS_KEY_ID": side["access_key"],
+        "AWS_SECRET_ACCESS_KEY": side["secret_key"],
+        "WALG_S3_PREFIX": storage_prefix,
+        "WALG_UPLOAD_CONCURRENCY": str(parallel),
+        "WALG_DOWNLOAD_CONCURRENCY": str(parallel),
+        "WALG_LOG_LEVEL": "NORMAL",
+    }
+    if kind == "mongodb":
+        config["MONGODB_URI"] = "mongodb://backup-exporter.invalid"
+    atomic_write(path, (json.dumps(config, indent=2) + "\n").encode())
+
+
+def secret_redactor(config):
+    values = []
+    for section, fields in {
+            "source": ("access_key", "secret_key"),
+            "destination": ("access_key", "secret_key"),
+            "gpg": ("key", "key_base64", "passphrase"),
+            "clickhouse": ("encryption_key",), "mongodb": ("admin_password",)}.items():
+        item = config.get(section)
+        if not isinstance(item, dict):
+            continue
+        for field in fields:
+            value = item.get(field)
+            if isinstance(value, str) and value:
+                values.extend((value, json.dumps(value)[1:-1]))
+                # Output is relayed line by line, including multiline restore keys.
+                values.extend(line for line in value.splitlines() if line)
+    values = sorted(set(values), key=len, reverse=True)
+
+    def redact(text):
+        for value in values:
+            text = text.replace(value, "[REDACTED]")
+        return text
+    return redact
+
+
+def walg_command(binary, arguments, redact, capture=False):
+    """Relay both streams without leaking credentials or inheriting storage settings."""
+    environment = {name: os.environ[name] for name in WALG_ENV_ALLOW if name in os.environ}
+    environment["AWS_EC2_METADATA_DISABLED"] = "true"
+    print(f"WAL-G: {redact(' '.join([binary, *map(str, arguments)]))}", flush=True)
+    lines = queue.Queue()
+    captured = []
+    tail = deque(maxlen=40)
+
+    def relay(stream, name):
+        try:
+            for line in stream:
+                lines.put((name, line))
+        finally:
+            lines.put((name, None))
+
+    process = subprocess.Popen([binary, *map(str, arguments)], env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding="utf-8", errors="replace", start_new_session=True)
+    threads = []
+    try:
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            thread = threading.Thread(target=relay, args=(stream, name), daemon=True)
+            thread.start()
+            threads.append(thread)
+        finished = 0
+        while finished < 2:
+            # A timed wait remains interruptible even while WAL-G is silent.
+            try:
+                name, line = lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line is None:
+                finished += 1
+                continue
+            safe_line = redact(line)
+            tail.append(safe_line[-8000:])
+            print(safe_line, end="", file=sys.stderr if name == "stderr" else sys.stdout, flush=True)
+            if capture and name == "stdout":
+                captured.append(line)
+        returncode = process.wait()
+        if returncode:
+            raise RuntimeError(f"WAL-G exited {returncode}: {''.join(tail)[-8000:]}")
+        return "".join(captured)
+    except BaseException:
+        kill_group(process)
+        process.wait()
+        raise
+    finally:
+        for thread in threads:
+            thread.join()
+        process.stdout.close()
+        process.stderr.close()
+
+
+def run_walg(args, config, cfg, src_prefix, dst_prefix, run_dir, metadata_file, metadata_uri):
+    kind = config["cluster_type"]
+    redact = secret_redactor(config)
+    report = {"engine": "walg", "cluster_type": kind, "backup_name": "LATEST",
+              "with_history": kind != "redis", "status": "running", "roots": []}
+    report_path = run_dir / "walg-result.json"
+    secret_paths = []
+
+    def safe_value(value):
+        if isinstance(value, str):
+            return redact(value)
+        if isinstance(value, list):
+            return [safe_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: safe_value(item) for key, item in value.items()}
+        return value
+
+    def save_report():
+        atomic_write(report_path, (json.dumps(safe_value(report), ensure_ascii=False, indent=2) + "\n").encode())
+
+    save_report()
+    current = None
+    try:
+        roots = discover_walg_roots(args.rclone, cfg, src_prefix, kind)
+        report["roots"] = [{"root": root, "source": src_prefix + root,
+                            "destination": dst_prefix + root, "status": "pending"} for root in roots]
+        save_report()
+        for index, current in enumerate(report["roots"]):
+            current["status"] = "copying"
+            save_report()
+            source_file = run_dir / f"walg-{index}-source.json"
+            destination_file = run_dir / f"walg-{index}-destination.json"
+            for path, side, uri in ((source_file, "source", current["source"]),
+                                    (destination_file, "destination", current["destination"])):
+                secret_paths.append(path)
+                make_walg_config(path, config[side], uri, kind, args.parallel)
+            command = ["--config", destination_file, "copy", "--from", source_file,
+                       "--to", destination_file, "--backup-name", "LATEST"]
+            if report["with_history"]:
+                command.append("--with-history")
+            walg_command(args.walg, command, redact)
+            current["status"] = "readback"
+            save_report()
+            output = walg_command(args.walg, ["--config", destination_file,
+                                             "backup-list", "--json", "--detail"], redact, capture=True)
+            backups = json.loads(output)
+            if not isinstance(backups, list) or not backups or any(not isinstance(b, dict) or not b for b in backups):
+                raise RuntimeError("WAL-G destination backup-list must return a nonempty array of backup objects")
+            current["destination_backups"] = backups
+            current["status"] = "complete"
+            save_report()
+        report["status"] = "metadata"
+        save_report()
+        upload_metadata(args.rclone, cfg, metadata_file, metadata_uri, run_dir)
+        cleanup_local_secrets(args.config, cfg, metadata_file, *secret_paths)
+        report["status"] = "complete"
+        save_report()
+        print(f"WAL-G copied and read back {len(roots)} roots. Report: {report_path}", flush=True)
+        return 0
+    except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        report["status"] = "interrupted" if interrupted else "failed"
+        report["error"] = redact(str(exc)) if not interrupted else "Interrupted by user"
+        if current is not None and current["status"] != "complete":
+            current["status"] = report["status"]
+            current["error"] = report["error"]
+        save_report()
+        raise
+
+
 def run(args, started):
     with ExitStack() as stack:
         try:
@@ -795,14 +1024,17 @@ def run(args, started):
             print("Interrupted by user", file=sys.stderr, flush=True)
             raise
         else:
+            success = "WAL-G copy and readback passed" if args.engine == "walg" else "verification passed"
             print(f"Run finished: exit={result}; "
-                  f"{'verification passed' if result == 0 else 'verification found discrepancies'}",
+                  f"{success if result == 0 else 'verification found discrepancies'}",
                   flush=True)
             return result
 
 
 def run_impl(args, started, stack):
     config = read_config(args.config)
+    if args.engine == "walg":
+        args.walg = ensure_walg(config, args.walg)
     src_prefix = prefix(config["source"]["prefix"], "source.prefix")
     dst_prefix = prefix(config["destination"]["prefix"], "destination.prefix") + config["cid"] + "/"
     cutoff = started + timedelta(minutes=10)
@@ -812,7 +1044,7 @@ def run_impl(args, started, stack):
     stamp = started.strftime("%Y%m%dT%H%M%S%fZ")
     run_dir = state_dir / f"run-{stamp}-{args.a}-of-{args.b}-{os.getpid()}"
     run_dir.mkdir(mode=0o700)
-    attach_run_log(stack, run_dir)
+    attach_run_log(stack, run_dir, args.engine)
     print(f"Run directory: {run_dir.resolve()}", flush=True)
     cfg = run_dir / "rclone.conf"
     make_rclone_config(cfg, config)
@@ -830,6 +1062,8 @@ def run_impl(args, started, stack):
     print(f"Checking destination PUT, GET, LS and cleanup under {dst_prefix}", flush=True)
     validate_destination(args.rclone, cfg, dst_prefix, run_dir)
     print("Destination PUT, GET, LS and cleanup: OK", flush=True)
+    if args.engine == "walg":
+        return run_walg(args, config, cfg, src_prefix, dst_prefix, run_dir, metadata_file, metadata_uri)
     print(f"Listing source shard under {src_prefix}", flush=True)
     initial_source = list_shard(args.rclone, cfg, src_prefix, args.a, args.b,
                                 run_dir, "source", snapshot=True,
@@ -970,25 +1204,24 @@ def ensure_rclone(binary):
         raise RuntimeError("apt-get completed, but rclone is still not in PATH")
 
 
-# Clusters that must never be copied. A run is refused when any of these ids
-# occurs in the source or destination bucket name. Regenerate from a clusters
-# CSV export with: python3 tools/update_blocked_cids.py clusters-prod.csv
+# None uses ~/sec/org_cids.csv at run time. The updater can instead embed a
+# frozenset here for hosts that distribute the uploader as a single file.
 # BEGIN BLOCKED CIDS
-
-BLOCKED_CIDS = []
-with open(os.path.join(SEC, "org_cids.csv")) as fh:
-    BLOCKED_CIDS = [l.strip() for l in fh.readlines()]
-
-if len(BLOCKED_CIDS) < 10:
-    print(os.path.join(SEC, "org_cids.csv") + " seems empty ?")
-    sys.exit(1)
-
-BLOCKED_CIDS = frozenset(BLOCKED_CIDS)
-
-BLOCKED_CID_LENGTHS = frozenset(len(cid) for cid in BLOCKED_CIDS)
+BLOCKED_CIDS = None
+# END BLOCKED CIDS
 
 
-def main():
+def load_blocked_cids(path=None):
+    if path is None and BLOCKED_CIDS is not None:
+        return frozenset(cid.lower() for cid in BLOCKED_CIDS)
+    path = Path(path) if path is not None else Path(SEC) / "org_cids.csv"
+    blocked = frozenset(line.strip().lower() for line in path.read_text().splitlines() if line.strip())
+    if len(blocked) < 10:
+        raise ValueError(f"{path} seems empty (fewer than 10 cluster ids)")
+    return blocked
+
+
+def main(argv=None):
     started = now()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, help="JSON config file")
@@ -997,11 +1230,11 @@ def main():
     parser.add_argument("-p", "--parallel", type=int, default=10)
     parser.add_argument("--verify", action="store_true",
                         help="only compare this shard and report time ranges of missing files")
-    parser.add_argument("--max-errors", type=int, default=100,
+    parser.add_argument("--max-errors", type=int,
                         help="abort a copy pass after this many errors that cannot be "
                              "skipped, instead of grinding through every remaining "
                              "object on a failing source (0 disables; default: 100)")
-    parser.add_argument("--stall-timeout", type=int, default=STALL_TIMEOUT,
+    parser.add_argument("--stall-timeout", type=int,
                         help="kill rclone if it prints nothing for this many seconds. "
                              "Must outlast the destination listing that rclone copy "
                              "does first, which is silent. 0 never kills "
@@ -1017,18 +1250,44 @@ def main():
     parser.add_argument("--state-dir", type=Path,
                         help="state directory (default: copy_s3_state_<cid>)")
     parser.add_argument("--rclone", default="rclone", help="rclone executable")
-    args = parser.parse_args()
+    parser.add_argument("--engine", choices=("rclone", "walg"), default="rclone",
+                        help="copy engine (default: rclone); walg exports LATEST per discovered root")
+    parser.add_argument("--walg", help="WAL-G executable (default: selected by cluster_type)")
+    args = parser.parse_args(argv)
     if args.b <= 0 or not 0 <= args.a < args.b:
         parser.error("require b > 0 and 0 <= a < b")
     if args.parallel <= 0:
         parser.error("require -p > 0")
+    if args.engine == "walg":
+        if (args.a, args.b) != (0, 1):
+            parser.error("--engine walg does not support object sharding")
+        if (args.verify or args.fast_list or args.no_traverse
+                or args.max_errors is not None or args.stall_timeout is not None):
+            parser.error("--verify, --fast-list, --no-traverse, --max-errors and --stall-timeout "
+                         "are supported only with --engine rclone")
+    elif args.walg:
+        parser.error("--walg requires --engine walg")
+    args.max_errors = 100 if args.max_errors is None else args.max_errors
+    args.stall_timeout = STALL_TIMEOUT if args.stall_timeout is None else args.stall_timeout
     if args.max_errors < 0:
         parser.error("require --max-errors >= 0")
     if args.stall_timeout < 0:
         parser.error("require --stall-timeout >= 0")
     try:
+        # Validate before dependency installation or any storage operations.
+        config = read_config(args.config)
+        if args.engine == "walg":
+            args.walg = ensure_walg(config, args.walg)
         ensure_rclone(args.rclone)
-        return run(args, started)
+        with ExitStack() as stack:
+            if args.engine == "walg":
+                def interrupt(signum, frame):
+                    raise KeyboardInterrupt(f"signal {signum}")
+                previous = signal.signal(signal.SIGTERM, interrupt)
+                stack.callback(signal.signal, signal.SIGTERM, previous)
+            return run(args, started)
+    except KeyboardInterrupt:
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 2

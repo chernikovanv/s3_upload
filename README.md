@@ -1,12 +1,17 @@
 # s3_upload
 
-`s3_upload.py` copies every object under one S3 prefix to another S3 prefix — across
+By default, `s3_upload.py` copies every object under one S3 prefix to another S3 prefix — across
 different endpoints and providers — and then verifies that the copy is complete.
 
 It is a thin, auditable driver around [`rclone`](https://rclone.org/): the script builds
 a throwaway rclone config, lists both sides itself, decides what still has to be copied,
 runs `rclone copy` in passes, and writes a machine-readable report of whatever did not
 make it.
+
+An optional [WAL-G mode](#wal-g-exports) exports `LATEST` and its required backup chain
+and history from each discovered backup root. `all_in_one.py` prepares either kind of
+export from a Support Hub ticket or manual input, using MDS/Copernic or a
+[Yandex Cloud source config](#ticket-exports-and-source-selection).
 
 Designed for one-shot migrations of a cluster's backup bucket, where the run must be
 restartable, shardable across machines, and must leave evidence of what happened.
@@ -20,6 +25,8 @@ restartable, shardable across machines, and must leave evidence of what happened
 - [Quick start](#quick-start)
 - [Command line](#command-line)
 - [Configuration file](#configuration-file)
+- [Ticket exports and source selection](#ticket-exports-and-source-selection)
+- [WAL-G exports](#wal-g-exports)
 - [Do-not-copy list](#do-not-copy-list)
 - [Sharding](#sharding)
 - [How a run works](#how-a-run-works)
@@ -38,10 +45,12 @@ restartable, shardable across machines, and must leave evidence of what happened
 
 ## What it does
 
+The default rclone mode:
+
 - Copies `source.prefix` → `destination.prefix/<cid>/`, preserving the key layout.
 - Splits the work into shards (`A` of `B`) so several processes or hosts can run in
   parallel over disjoint parts of the keyspace.
-- Refuses outright if either bucket belongs to a cluster on the embedded
+- Refuses outright if either bucket belongs to a cluster on the
   [do-not-copy list](#do-not-copy-list).
 - Runs preflight checks before touching data: source `LS`, source `GET`, and a full
   destination `PUT` → `GET` → `LS` → `DELETE` probe cycle.
@@ -76,13 +85,20 @@ multipart objects.
   `apt-get update && apt-get install -y rclone`, using `sudo -n` when not running as
   root. On any other platform, install rclone yourself, or point at a binary with
   `--rclone /path/to/rclone`.
+- **Do-not-copy list** at `~/sec/org_cids.csv`, one cluster ID per line, with at
+  least 10 distinct IDs. An embedded list can replace this file for standalone
+  uploader deployments; see [Do-not-copy list](#do-not-copy-list).
+- **WAL-G**, only for `--engine walg`: install the matching database binary with
+  `copy --backup-name LATEST` and, except for Redis, `--with-history` support.
+  WAL-G is not installed automatically. rclone is still needed for discovery,
+  destination preflight, and metadata upload.
 - Network access to both endpoints, and credentials with:
   - source: `ListBucket`, `GetObject`
   - destination: `ListBucket`, `PutObject`, `GetObject`, `DeleteObject`
     (`DeleteObject` is required — the destination probe cleans up after itself)
 
-Both remotes are always addressed in **path style** (`force_path_style = true`), and
-bucket existence is not checked (`no_check_bucket = true`).
+Both engines use **path style**. rclone also disables bucket existence checks
+(`no_check_bucket = true`).
 
 ---
 
@@ -130,6 +146,7 @@ appended to `destination.prefix` automatically.
 
 ```
 python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclone PATH]
+python3 s3_upload.py CONFIG --engine walg [-p N] [--walg PATH] [--state-dir DIR] [--rclone PATH]
 ```
 
 | Argument | Default | Meaning |
@@ -137,7 +154,9 @@ python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclon
 | `CONFIG` | — | Path to the JSON config file (see below). |
 | `A` | `0` | Shard remainder handled by this process. Must satisfy `0 <= A < B`. |
 | `B` | `1` | Total number of shards. Must be `> 0`. |
-| `-p`, `--parallel` | `10` | rclone `--transfers`. Checkers are set to `max(4, N)`. |
+| `-p`, `--parallel` | `10` | rclone `--transfers` (checkers: `max(4, N)`), or both WAL-G upload/download concurrency settings. |
+| `--engine` | `rclone` | `rclone` copies the whole prefix; `walg` copies `LATEST` per discovered backup root. |
+| `--walg` | by cluster type | WAL-G binary override; requires `--engine walg`. |
 | `--verify` | off | Compare only; copy nothing. See [Verify-only mode](#verify-only-mode). |
 | `--max-errors` | `100` | Abort a copy pass once the source is clearly broken, instead of grinding through every remaining object. `0` disables. See [A failing source](#a-failing-source). |
 | `--stall-timeout` | `28800` (8 h) | Kill rclone if it prints nothing for this many seconds. Must outlast the silent destination listing `rclone copy` does first. `0` never kills. |
@@ -145,6 +164,10 @@ python3 s3_upload.py CONFIG [A [B]] [-p N] [--verify] [--state-dir DIR] [--rclon
 | `--no-traverse` | off | Pass rclone `--no-traverse` to the copy. Only pays off when little is left to copy — see [Resuming](#resuming-an-interrupted-migration). |
 | `--state-dir` | `copy_s3_state_<cid>` | Where run directories are created. |
 | `--rclone` | `rclone` | rclone executable name or path. |
+
+Object sharding (`A/B` other than `0/1`), `--verify`, `--max-errors`, `--stall-timeout`,
+`--fast-list`, and `--no-traverse` are rclone-only and are rejected in WAL-G mode,
+including explicitly supplied default tuning values.
 
 ---
 
@@ -202,7 +225,8 @@ written verbatim to the destination** as migration metadata at:
 <destination.prefix>/<cid>/__migration__/config-<timestamp>-<A>-of-<B>.json
 ```
 
-The upload is read back and byte-compared before the copy starts. This is deliberate:
+The upload is read back and byte-compared before an rclone copy starts, or after all
+WAL-G roots have copied and passed backup-list readback. This is deliberate:
 the restore side needs the decryption material alongside the data. It also means the
 destination bucket will contain your GPG key and any passphrase or admin password —
 see [Security notes](#security-notes).
@@ -211,12 +235,125 @@ S3 credentials are **never** uploaded.
 
 ---
 
+## Ticket exports and source selection
+
+`all_in_one.py` keeps the current MDS/Copernic source and rclone engine as defaults:
+
+```bash
+python3 all_in_one.py TICKET
+python3 all_in_one.py TICKET --manual
+```
+
+For a Yandex Cloud source, first run `dbaas s3_migration CID` from `cloud/mdb/cli`
+in a directory without an existing `config.json`. That command writes a private
+`config.json`; the Backstage S3 migration page generates the same JSON format.
+Pass that file to the wrapper:
+
+```bash
+python3 all_in_one.py TICKET --source yandexcloud --source-config /path/to/config.json
+python3 all_in_one.py TICKET --source yandexcloud --source-config /path/to/config.json --engine walg
+```
+
+| Option | Behavior |
+| --- | --- |
+| `--source mds` | Default. Uses `https://s3.mds.yandex.net`, bucket `copernic-cp-<cid>-backups`, and Copernic credentials from `~/sec/all_in_one_config.json`. |
+| `--source yandexcloud` | Requires `--source-config`. Uses its actual source endpoint, bucket/prefix, region, and per-cluster credentials. Bucket names are not inferred from CID/type. |
+| `--source-config FILE` | Imports GPG and any ClickHouse/MongoDB restore fields for either source. CID and normalized cluster type must match the ticket. |
+| `--engine rclone\|walg` | Defaults to rclone. Forwards the selected engine to the uploader. |
+| `--walg PATH` | Optional binary override when using WAL-G. |
+| `--manual` | Enter ticket destination and cluster fields interactively instead of fetching Support Hub. |
+
+The ticket/manual destination replaces the imported config's destination placeholders.
+The original imported file is preserved. The generated runtime config is written to
+`~/exports/TICKET/config.json` with mode `0600` in a `0700` ticket directory, and the
+uploader deletes that runtime config on success. Keep the imported file outside the
+ticket's runtime `config.json` and `ticket.json` paths.
+
+Without `--source-config`, MDS exports continue reading GPG material from
+`~/sec/gpg_keys.json`. ClickHouse needs `clickhouse.encryption_key`, and MongoDB needs
+`mongodb.admin_password`; use the imported CLI config to supply those fields.
+The wrapper supports PostgreSQL, MySQL, Redis, MongoDB, ClickHouse, and Greenplum.
+It checks the ticket CID against `~/sec/org_cids.csv`, in addition to the uploader's
+bucket checks. Importing either script or running `--help` reads no secret files.
+
+To use `s3_upload.py` directly, fill in the generated config's destination fields and
+pass it as `CONFIG`; the source-selection flags belong only to `all_in_one.py`.
+
+## WAL-G exports
+
+```bash
+python3 s3_upload.py config.json --engine walg
+python3 s3_upload.py config.json --engine walg --walg /opt/bin/wal-g-mysql -p 16
+```
+
+| Cluster type | Default binary | Copy options |
+| --- | --- | --- |
+| `postgresql` | `wal-g` | `--backup-name LATEST --with-history` |
+| `mysql` | `wal-g-mysql` | `--backup-name LATEST --with-history` |
+| `mongodb` | `wal-g-mongo` | `--backup-name LATEST --with-history` |
+| `redis` | `wal-g-redis` | `--backup-name LATEST` (no history flag exists) |
+| `greenplum` | `wal-g-gp` | `--backup-name LATEST --with-history` |
+
+Greenplum is supported **without cloud storage**. The operator must select an eligible
+cluster; the imported CLI config does not describe cloud-storage usage. Exporting a
+cloud-storage bucket is outside this workflow. ClickHouse uses rclone; WAL-G mode
+rejects unsupported cluster types.
+
+The uploader lists directory prefixes beneath `source.prefix` to discover roots with
+an immediate `basebackups_005` directory, including `source.prefix` itself. Discovery
+stops descending once a root is found and excludes `__migration__` and Greenplum's
+`segments_005` trees. Greenplum WAL-G handles coordinator and segment dependencies.
+No roots is an error. A root without a completed backup fails through WAL-G.
+
+Every discovered version/shard root is processed sequentially, in sorted order.
+WAL-G receives literal `LATEST` for each root and selects backups and history itself;
+the Python wrapper does not choose backup IDs. With multiple MongoDB shards, these
+are independent latest backups, not a coordinated cluster snapshot.
+
+Relative paths are preserved. For example, a source root
+`s3://src/wal-e/CID/1400/` under `s3://src/` maps to
+`s3://dst/restored/CID/wal-e/CID/1400/` when the configured destination is
+`s3://dst/restored/`. Setting `source.prefix` to the exact backup root instead maps
+its contents directly beneath `s3://dst/restored/CID/`.
+
+For each root, the script writes private source/destination WAL-G JSON configs and runs:
+
+```text
+WALG --config DEST copy --from SOURCE --to DEST --backup-name LATEST [--with-history]
+WALG --config DEST backup-list --json --detail
+```
+
+S3 settings are explicit, inherited AWS/WAL-G settings are excluded, and MongoDB gets
+a placeholder URI for its configuration validation. If a region is omitted, WAL-G
+uses `us-east-1`. GPG/restore keys are carried as metadata rather than configured for
+encryption during copying. TLS verification remains enabled.
+
+Success requires both a successful copy command and a successful, nonempty destination
+backup list for every root. This confirms readback; it is not a restore test or a full
+comparison with all source objects. No rclone cutoff, skipped-object policy, or full
+object audit applies. The shared source listing and destination PUT/GET/LS/DELETE
+preflight still run before copying.
+
+`walg-result.json` records relative roots, source/destination prefixes, status, and the
+returned destination backup lists. `run.log` streams redacted WAL-G output. Failed
+roots stop the run; remaining roots stay pending. Restore metadata is uploaded and
+read back only after all roots succeed. The input runtime config, rclone config,
+WAL-G configs, and local metadata are removed on success. Failures retain them for
+retry. Re-run the same command to let WAL-G resume, skipping already copied data;
+`LATEST` and archived history are resolved again on each run.
+
+Ctrl-C or SIGTERM terminates the active WAL-G process group and records interruption.
+WAL-G has no wrapper-level idle-output timeout; its own errors stop the run.
+
+---
+
 ## Do-not-copy list
 
-Some clusters must never be migrated. Their cluster ids are **embedded in
-`s3_upload.py`** as `BLOCKED_CIDS` (currently 2673 ids, near the bottom of the file).
-Embedding rather than shipping a sidecar file is deliberate: this is a single-file tool
-that gets copied to migration hosts on its own, and the protection has to travel with it.
+Some clusters must never be migrated. By default, both scripts read their cluster IDs
+from `~/sec/org_cids.csv`, one ID per line, at run time. A missing file or fewer than
+10 distinct IDs refuses the run. `s3_upload.py` can alternatively carry an embedded
+`BLOCKED_CIDS` set, generated by the helper below. The wrapper always requires the
+local file for its direct ticket-CID check.
 
 Before anything else — before any network call, before the state directory is created —
 `read_config` checks the **bucket name** of `source.prefix` and `destination.prefix`. If
@@ -243,7 +380,9 @@ Matching details:
 
 ### Refreshing the list
 
-Re-export the clusters CSV, then regenerate the embedded block in place:
+Replace `~/sec/org_cids.csv` with an updated one-ID-per-line list for the default
+workflow. To embed the IDs in a standalone uploader, use a CSV export with a
+`cluster_id` column:
 
 ```bash
 python3 tools/update_blocked_cids.py ~/Downloads/clusters-prod.csv
@@ -448,9 +587,10 @@ hundred `LIST` calls. It is off by default for that reason.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Verification passed — every eligible source object is present at the destination with the same size. Local credential files were deleted. |
-| `1` | The copy ran, but verification found missing objects or size mismatches. See `verification.json` and `failed.jsonl`. **Nothing was deleted.** |
-| `2` | Fatal error — bad config, failed preflight, unreachable endpoint, rclone missing. |
+| `0` | rclone size verification passed, or all WAL-G copies and backup-list readbacks passed. Local runtime credential files were deleted. Copy runs also uploaded and read back metadata. |
+| `1` | rclone verification found missing objects or size mismatches. See `verification.json` and `failed.jsonl`. **Nothing was deleted.** |
+| `2` | Fatal error — bad config, failed preflight/copy/readback/metadata, unreachable endpoint, or a missing binary. |
+| `130` | Interrupted. WAL-G also uses this code for SIGTERM. |
 
 `1` is the "re-run me" code: running the same command again re-lists both sides and
 copies only what is still absent.
@@ -635,6 +775,17 @@ description and exit codes.
 | Exit `1`, and `skipped.jsonl` holds only `.json` keys | The source cannot serve those sidecars. The data itself copied fine; decide per backup whether a missing `metadata.json` / `*_backup_stop_sentinel.json` makes it unrestorable. |
 | `FATAL: source GET returned N bytes for ...` | A short read on **non-JSON** data — the source is returning truncated objects. Not skipped on purpose; investigate before copying. |
 
+
+## Tests
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+Tests use temporary local storage and stub rclone/WAL-G executables. They cover
+source-config merging, both engines, multiple roots, failures and interruption;
+they do not contact S3 or Support Hub. Actual restore validation remains an operational
+check with the installed WAL-G version and real backups.
 
 ## Layout
 ~           - home dir
